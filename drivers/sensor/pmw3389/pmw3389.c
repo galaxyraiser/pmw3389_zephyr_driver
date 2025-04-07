@@ -5,24 +5,32 @@
 #define DT_DRV_COMPAT pixart_pmw3389
 
 #include "pmw3389.h"
-
+#include <zephyr/drivers/gpio.h>
+#include <zephyr/pm/device.h>
 #include <zephyr/drivers/spi.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/__assert.h>
+#include <zephyr/input/input.h>
 
-LOG_MODULE_REGISTER(pmw3389, LOG_LEVEL_INF);
+LOG_MODULE_REGISTER(pmw3389, LOG_LEVEL_DBG);
 
 // Undefine to fall back to reading each register separately
 #define FETCH_USING_BURST_READ
 
 struct pmw3389_config {
 	struct spi_dt_spec spi;
+    struct gpio_dt_spec irq_gpio;
 	int resolution_cpi; // [counts/inch]
 };
 
 struct pmw3389_data {
-	int16_t delta_x;
-	int16_t delta_y;
+    const struct device     *dev;
+
+    struct gpio_callback    irq_gpio_cb;    // motion pin irq callback
+    struct k_work           trigger_work;   // realtrigger job
+
+    int16_t delta_x;
+    int16_t delta_y;
 };
 
 // region SPI Registers and Timing Constants
@@ -330,15 +338,100 @@ int pwm3389_get_raw_data(struct device *dev, uint8_t *out)
 	return 0;
 }
 
+static int pmw3389_report_data(const struct device *dev) {
+    struct pmw3389_data *data = dev->data;
+    LOG_DBG("Report data");
+
+    if (data->delta_x != 0) {
+      input_report_rel(dev, INPUT_REL_X, data->delta_x, false, K_FOREVER);
+    }
+    if (data->delta_y != 0) {
+      input_report_rel(dev, INPUT_REL_Y, data->delta_y, true, K_FOREVER);
+    }
+
+    return 0;
+}
+
+static int pmw3389_set_interrupt(const struct device *dev, const bool en) {
+    const struct pmw3389_config *config = dev->config;
+    const struct gpio_dt_spec *irq = &config->irq_gpio;
+
+    int ret = gpio_pin_interrupt_configure_dt(irq, en ? GPIO_INT_LEVEL_ACTIVE : GPIO_INT_DISABLE);
+    if (ret < 0) {
+        LOG_ERR("can't set interrupt");
+    }
+    return ret;
+}
+
+static void pmw3389_gpio_callback(const struct device *gpiob, struct gpio_callback *cb,
+                                  uint32_t pins) {
+    struct pmw3389_data *data = CONTAINER_OF(cb, struct pmw3389_data, irq_gpio_cb);
+    const struct device *dev = data->dev;
+    pmw3389_set_interrupt(dev, false);
+    k_work_submit(&data->trigger_work);
+}
+
+static void pmw3389_work_callback(struct k_work *work) {
+    struct pmw3389_data *data = CONTAINER_OF(work, struct pmw3389_data, trigger_work);
+    const struct device *dev = data->dev;
+    LOG_DBG("Work callback");
+    pmw3389_report_data(dev);
+    pmw3389_set_interrupt(dev, true);
+}
+
+static int pmw3389_init_irq(const struct device *dev) {
+    int err;
+    struct pmw3389_data *data = dev->data;
+    const struct pmw3389_config *config = dev->config;
+
+    // check readiness of irq gpio pin
+    if (!device_is_ready(config->irq_gpio.port)) {
+        LOG_ERR("IRQ GPIO device not ready");
+        return -ENODEV;
+    }
+
+    // init the irq pin
+    err = gpio_pin_configure_dt(&config->irq_gpio, GPIO_INPUT);
+    if (err) {
+        LOG_ERR("Cannot configure IRQ GPIO");
+        return err;
+    }
+
+    // setup and add the irq callback associated
+    gpio_init_callback(&data->irq_gpio_cb, pmw3389_gpio_callback, BIT(config->irq_gpio.pin));
+
+    err = gpio_add_callback(config->irq_gpio.port, &data->irq_gpio_cb);
+    if (err) {
+        LOG_ERR("Cannot add IRQ GPIO callback");
+    }
+
+    return err;
+}
+
 int pmw3389_init(const struct device *dev)
 {
 	LOG_INF("Initializing PMW3389");
-	const struct pmw3389_config *config = dev->config;
+    //return 0;
 
+	const struct pmw3389_config *config = dev->config;
 	const struct spi_dt_spec *spec = &config->spi;
+    struct pmw3389_data *data = dev->data;
+
 
 	// SPI: Manual CS control, Zephyr does delay between pulling NCS low and start, but does not
 	//  wait after transmission. NCS is not pulled high automatically, as configured
+
+    data->dev = dev;
+    k_work_init(&data->trigger_work, pmw3389_work_callback);
+
+    data->delta_x = 500;
+    data->delta_y = 100;
+
+    // init irq routine
+    int err = pmw3389_init_irq(dev);
+    if (err) {
+        return err;
+    }
 
 	// 1. Apply Power
 	// 2. Drive NCS high, then low (done by driver)
@@ -435,12 +528,14 @@ int pmw3389_init(const struct device *dev)
 	LOG_DBG("Verified inverse product ID!");
 
 	TRY(spi_release_dt(spec));
+
 	LOG_INF("Done!");
 	return 0;
 }
 
 int pmw3389_sample_fetch(const struct device *dev, enum sensor_channel chan)
 {
+    LOG_DBG("sample_fetch");
 	if (chan != SENSOR_CHAN_PMW3389_DISTANCE_X && chan != SENSOR_CHAN_PMW3389_DISTANCE_Y &&
 	    chan != SENSOR_CHAN_ALL) {
 		return -EINVAL;
@@ -466,6 +561,8 @@ int pmw3389_channel_get(const struct device *dev, enum sensor_channel chan,
 
 	int16_t counts;
 
+    LOG_DBG("channel_get");
+
 	switch ((int)chan) {
 	case SENSOR_CHAN_PMW3389_DISTANCE_X:
 		counts = data->delta_x;
@@ -483,22 +580,39 @@ int pmw3389_channel_get(const struct device *dev, enum sensor_channel chan,
 }
 
 // endregion
-
 static const struct sensor_driver_api pmw3389_api = {
 	.sample_fetch = pmw3389_sample_fetch,
 	.channel_get = pmw3389_channel_get,
 };
+
+#if IS_ENABLED(CONFIG_PM_DEVICE)
+
+static int pmw3389_pm_action(const struct device *dev, enum pm_device_action action) {
+    switch (action) {
+    case PM_DEVICE_ACTION_SUSPEND:
+        LOG_DBG("Suspend");
+        return pmw3389_set_interrupt(dev, false);
+    case PM_DEVICE_ACTION_RESUME:
+        LOG_DBG("Resume");
+        return pmw3389_set_interrupt(dev, true);
+    default:
+        return -ENOTSUP;
+    }
+}
+
+#endif // IS_ENABLED(CONFIG_PM_DEVICE)
 
 #define PMW3389_INIT(n)                                                                            \
 	static struct pmw3389_data pmw3389_data_##n;                                               \
 	static const struct pmw3389_config pmw3389_config_##n = {                                  \
 		.spi = SPI_DT_SPEC_INST_GET(n,                                                     \
 					    SPI_OP_MODE_MASTER | SPI_WORD_SET(8U) |                \
-						    SPI_HOLD_ON_CS | SPI_MODE_CPOL |               \
-						    SPI_MODE_CPHA,                                 \
-					    0U),                                                   \
-		.resolution_cpi = DT_INST_PROP(n, resolution)};                                    \
-	DEVICE_DT_INST_DEFINE(n, &pmw3389_init, NULL, &pmw3389_data_##n, &pmw3389_config_##n,      \
+						    SPI_HOLD_ON_CS | SPI_MODE_CPOL |                                    \
+						    SPI_MODE_CPHA,                                                      \
+					    0U),                                                                    \
+		.resolution_cpi = DT_INST_PROP(n, resolution)};                                         \
+    PM_DEVICE_DT_INST_DEFINE(n, pmw3389_pm_action);                                             \
+	DEVICE_DT_INST_DEFINE(n, &pmw3389_init, PM_DEVICE_DT_INST_GET(n), &pmw3389_data_##n, &pmw3389_config_##n,       \
 			      POST_KERNEL, CONFIG_SENSOR_INIT_PRIORITY, &pmw3389_api);
 
 DT_INST_FOREACH_STATUS_OKAY(PMW3389_INIT)

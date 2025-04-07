@@ -10,8 +10,12 @@ compatible: "pixart,pmw3389"
 include: spi-device.yaml
 
 properties:
+  irq-gpios:
+    type: phandle-array
+    required: true
   resolution:
     type: int
     required: true
     description: |
       Resolution in counts per inch, multiples of 50, from 50 to 16000
+
