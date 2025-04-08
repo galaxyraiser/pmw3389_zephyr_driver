@@ -338,100 +338,104 @@ int pwm3389_get_raw_data(struct device *dev, uint8_t *out)
 	return 0;
 }
 
+// forward declaration
+int pmw3389_sample_fetch(const struct device *dev, enum sensor_channel chan);
+int pmw3389_channel_get(const struct device *dev, enum sensor_channel chan,
+			struct sensor_value *val);
+
 static int pmw3389_report_data(const struct device *dev) {
-    struct pmw3389_data *data = dev->data;
-    LOG_DBG("Report data");
+	struct pmw3389_data *data = dev->data;
 
-    if (data->delta_x != 0) {
-      input_report_rel(dev, INPUT_REL_X, data->delta_x, false, K_FOREVER);
-    }
-    if (data->delta_y != 0) {
-      input_report_rel(dev, INPUT_REL_Y, data->delta_y, true, K_FOREVER);
-    }
+	pmw3389_sample_fetch(dev, SENSOR_CHAN_POS_DX);
+	//LOG_DBG("X: %i, Y: %i", data->delta_x, data->delta_y);
 
-    return 0;
+	if (data->delta_x != 0) {
+		input_report_rel(dev, INPUT_REL_X, data->delta_x, false, K_FOREVER);
+	}
+	if (data->delta_y != 0) {
+		input_report_rel(dev, INPUT_REL_Y, data->delta_y, true, K_FOREVER);
+	}
+
+	return 0;
 }
 
 static int pmw3389_set_interrupt(const struct device *dev, const bool en) {
-    const struct pmw3389_config *config = dev->config;
-    const struct gpio_dt_spec *irq = &config->irq_gpio;
+	const struct pmw3389_config *config = dev->config;
+	const struct gpio_dt_spec *irq = &config->irq_gpio;
 
-    int ret = gpio_pin_interrupt_configure_dt(irq, en ? GPIO_INT_LEVEL_ACTIVE : GPIO_INT_DISABLE);
-    if (ret < 0) {
-        LOG_ERR("can't set interrupt");
-    }
-    return ret;
+	int ret = gpio_pin_interrupt_configure_dt(irq, en ? GPIO_INT_LEVEL_ACTIVE : GPIO_INT_DISABLE);
+	if (ret < 0) {
+		LOG_ERR("can't set interrupt");
+	}
+	return ret;
 }
 
 static void pmw3389_gpio_callback(const struct device *gpiob, struct gpio_callback *cb,
-                                  uint32_t pins) {
-    struct pmw3389_data *data = CONTAINER_OF(cb, struct pmw3389_data, irq_gpio_cb);
-    const struct device *dev = data->dev;
-    pmw3389_set_interrupt(dev, false);
-    k_work_submit(&data->trigger_work);
+								  uint32_t pins) {
+	struct pmw3389_data *data = CONTAINER_OF(cb, struct pmw3389_data, irq_gpio_cb);
+	const struct device *dev = data->dev;
+	pmw3389_set_interrupt(dev, false);
+	k_work_submit(&data->trigger_work);
 }
 
 static void pmw3389_work_callback(struct k_work *work) {
-    struct pmw3389_data *data = CONTAINER_OF(work, struct pmw3389_data, trigger_work);
-    const struct device *dev = data->dev;
-    LOG_DBG("Work callback");
-    pmw3389_report_data(dev);
-    pmw3389_set_interrupt(dev, true);
+	struct pmw3389_data *data = CONTAINER_OF(work, struct pmw3389_data, trigger_work);
+	const struct device *dev = data->dev;
+	pmw3389_report_data(dev);
+	pmw3389_set_interrupt(dev, true);
 }
 
 static int pmw3389_init_irq(const struct device *dev) {
-    int err;
-    struct pmw3389_data *data = dev->data;
-    const struct pmw3389_config *config = dev->config;
+	int err;
+	struct pmw3389_data *data = dev->data;
+	const struct pmw3389_config *config = dev->config;
 
-    // check readiness of irq gpio pin
-    if (!device_is_ready(config->irq_gpio.port)) {
-        LOG_ERR("IRQ GPIO device not ready");
-        return -ENODEV;
-    }
+	// check readiness of irq gpio pin
+	if (!device_is_ready(config->irq_gpio.port)) {
+		LOG_ERR("IRQ GPIO device not ready");
+		return -ENODEV;
+	}
 
-    // init the irq pin
-    err = gpio_pin_configure_dt(&config->irq_gpio, GPIO_INPUT);
-    if (err) {
-        LOG_ERR("Cannot configure IRQ GPIO");
-        return err;
-    }
+	// init the irq pin
+	err = gpio_pin_configure_dt(&config->irq_gpio, GPIO_INPUT);
+	if (err) {
+		LOG_ERR("Cannot configure IRQ GPIO");
+		return err;
+	}
 
-    // setup and add the irq callback associated
-    gpio_init_callback(&data->irq_gpio_cb, pmw3389_gpio_callback, BIT(config->irq_gpio.pin));
+	// setup and add the irq callback associated
+	gpio_init_callback(&data->irq_gpio_cb, pmw3389_gpio_callback, BIT(config->irq_gpio.pin));
 
-    err = gpio_add_callback(config->irq_gpio.port, &data->irq_gpio_cb);
-    if (err) {
-        LOG_ERR("Cannot add IRQ GPIO callback");
-    }
+	err = gpio_add_callback(config->irq_gpio.port, &data->irq_gpio_cb);
+	if (err) {
+		LOG_ERR("Cannot add IRQ GPIO callback");
+	}
 
-    return err;
+	// Enable IRQ
+	pmw3389_set_interrupt(dev, true);
+
+	return err;
 }
 
 int pmw3389_init(const struct device *dev)
 {
 	LOG_INF("Initializing PMW3389");
-    //return 0;
 
 	const struct pmw3389_config *config = dev->config;
 	const struct spi_dt_spec *spec = &config->spi;
-    struct pmw3389_data *data = dev->data;
+	struct pmw3389_data *data = dev->data;
 
+	data->dev = dev;
+	k_work_init(&data->trigger_work, pmw3389_work_callback);
+
+	// init irq routine
+	int err = pmw3389_init_irq(dev);
+	if (err) {
+		return err;
+	}
 
 	// SPI: Manual CS control, Zephyr does delay between pulling NCS low and start, but does not
 	//  wait after transmission. NCS is not pulled high automatically, as configured
-
-    data->dev = dev;
-    k_work_init(&data->trigger_work, pmw3389_work_callback);
-
-    data->delta_x = 500;
-    data->delta_y = 100;
-
-    // init irq routine
-    int err = pmw3389_init_irq(dev);
-    if (err) {
-        return err;
-    }
 
 	// 1. Apply Power
 	// 2. Drive NCS high, then low (done by driver)
@@ -535,9 +539,8 @@ int pmw3389_init(const struct device *dev)
 
 int pmw3389_sample_fetch(const struct device *dev, enum sensor_channel chan)
 {
-    LOG_DBG("sample_fetch");
-	if (chan != SENSOR_CHAN_PMW3389_DISTANCE_X && chan != SENSOR_CHAN_PMW3389_DISTANCE_Y &&
-	    chan != SENSOR_CHAN_ALL) {
+	if (chan != SENSOR_CHAN_POS_DX && chan != SENSOR_CHAN_POS_DY &&
+		chan != SENSOR_CHAN_ALL) {
 		return -EINVAL;
 	}
 
@@ -558,16 +561,13 @@ int pmw3389_channel_get(const struct device *dev, enum sensor_channel chan,
 {
 	const struct pmw3389_config *config = dev->config;
 	const struct pmw3389_data *data = dev->data;
-
 	int16_t counts;
 
-    LOG_DBG("channel_get");
-
 	switch ((int)chan) {
-	case SENSOR_CHAN_PMW3389_DISTANCE_X:
+	case SENSOR_CHAN_POS_DX:
 		counts = data->delta_x;
 		break;
-	case SENSOR_CHAN_PMW3389_DISTANCE_Y:
+	case SENSOR_CHAN_POS_DY:
 		counts = data->delta_y;
 		break;
 	default:
@@ -610,9 +610,10 @@ static int pmw3389_pm_action(const struct device *dev, enum pm_device_action act
 						    SPI_HOLD_ON_CS | SPI_MODE_CPOL |                                    \
 						    SPI_MODE_CPHA,                                                      \
 					    0U),                                                                    \
-		.resolution_cpi = DT_INST_PROP(n, resolution)};                                         \
-    PM_DEVICE_DT_INST_DEFINE(n, pmw3389_pm_action);                                             \
+		.resolution_cpi = DT_INST_PROP(n, resolution),                                          \
+		.irq_gpio = GPIO_DT_SPEC_INST_GET(n, irq_gpios)};                                       \
+	PM_DEVICE_DT_INST_DEFINE(n, pmw3389_pm_action);                                             \
 	DEVICE_DT_INST_DEFINE(n, &pmw3389_init, PM_DEVICE_DT_INST_GET(n), &pmw3389_data_##n, &pmw3389_config_##n,       \
-			      POST_KERNEL, CONFIG_SENSOR_INIT_PRIORITY, &pmw3389_api);
+			      POST_KERNEL, CONFIG_APPLICATION_INIT_PRIORITY, &pmw3389_api);
 
 DT_INST_FOREACH_STATUS_OKAY(PMW3389_INIT)

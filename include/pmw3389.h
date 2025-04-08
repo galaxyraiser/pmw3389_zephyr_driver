@@ -11,11 +11,6 @@
 extern "C" {
 #endif
 
-enum sensor_channel_pmw3389 {
-	SENSOR_CHAN_PMW3389_DISTANCE_X = SENSOR_CHAN_PRIV_START,
-	SENSOR_CHAN_PMW3389_DISTANCE_Y
-};
-
 /**
  * Read raw pixel data from sensor
  * @note Untested, may be broken
