@@ -19,18 +19,25 @@ LOG_MODULE_REGISTER(pmw3389, LOG_LEVEL_DBG);
 
 struct pmw3389_config {
 	struct spi_dt_spec spi;
-    struct gpio_dt_spec irq_gpio;
+	struct gpio_dt_spec irq_gpio;
 	int resolution_cpi; // [counts/inch]
 };
 
 struct pmw3389_data {
-    const struct device     *dev;
+	const struct device     *dev;
 
-    struct gpio_callback    irq_gpio_cb;    // motion pin irq callback
-    struct k_work           trigger_work;   // realtrigger job
+	struct gpio_callback    irq_gpio_cb;    // motion pin irq callback
+	struct k_work           trigger_work;   // realtrigger job
 
-    int16_t delta_x;
-    int16_t delta_y;
+	int16_t delta_x;
+	int16_t delta_y;
+
+	int16_t dx, dy;
+
+#if CONFIG_PMW3389_REPORT_INTERVAL_MIN > 0
+	int64_t last_smp_time;
+	int64_t last_rpt_time;
+#endif
 };
 
 // region SPI Registers and Timing Constants
@@ -46,6 +53,7 @@ struct pmw3389_data {
 #define REG_Resolution_L	    0x0E
 #define REG_Resolution_H	    0x0F
 #define REG_Frame_Capture	    0x12
+#define REG_SROM_ID				0x2A
 #define REG_Power_Up_Reset	    0x3A
 #define REG_Inverse_Product_ID	    0x3F
 #define Expected_Inverse_Product_ID 0xB8
@@ -78,24 +86,30 @@ struct pmw3389_data {
 // endregion
 
 // region Utility
+#define xstr(a) str(a)
+#define str(a) #a
 
 // Return error code, if != 0
-#define TRY(that)                                                                                  \
-	{                                                                                          \
-		int error = that;                                                                  \
-		if (error != 0) {                                                                  \
-			return error;                                                              \
-		}                                                                                  \
+#define TRY(that)																			\
+	{																						\
+		int error = that;																	\
+		const char *param = xstr(that);														\
+		if (error != 0) {																	\
+			LOG_ERR("Operation %s failed", param);											\
+			return error;																	\
+		}																					\
 	}
 
 // Release SPI and return error code, if != 0
-#define TRY_R(that)                                                                                \
-	{                                                                                          \
-		int error = that;                                                                  \
-		if (error != 0) {                                                                  \
-			spi_release_dt(spec);                                                      \
-			return error;                                                              \
-		}                                                                                  \
+#define TRY_R(that)																			\
+	{																						\
+		int error = that;																	\
+		const char *param = xstr(that);														\
+		if (error != 0) {																	\
+			LOG_ERR("Operatin %s failed", param);											\
+			spi_release_dt(spec);															\
+			return error;																	\
+		}																					\
 	}
 
 static bool is_bit_set(uint8_t value, uint8_t index)
@@ -235,7 +249,7 @@ int read_multiple(const struct spi_dt_spec *spec, const uint8_t addresses[], int
 // NOLINTNEXTLINE(readability-non-const-parameter)
 int burst_read_motion(const struct spi_dt_spec *spec, uint8_t out[], int nr_bytes)
 {
-	LOG_DBG("Starting burst read!");
+	//LOG_DBG("Starting burst read!");
 	// 1. Write any value to Motion_Burst register
 	TRY_R(write_register_nr(spec, REG_Motion_Burst, 0));
 
@@ -255,7 +269,7 @@ int burst_read_motion(const struct spi_dt_spec *spec, uint8_t out[], int nr_byte
 
 	// Motion burst may be terminated by pulling NCS high for at least t_BEXIT
 	TRY(spi_release_dt(spec));
-	LOG_DBG("Burst read done.");
+	//LOG_DBG("Burst read done.");
 	return 0;
 }
 
@@ -349,11 +363,42 @@ static int pmw3389_report_data(const struct device *dev) {
 	pmw3389_sample_fetch(dev, SENSOR_CHAN_POS_DX);
 	//LOG_DBG("X: %i, Y: %i", data->delta_x, data->delta_y);
 
-	if (data->delta_x != 0) {
-		input_report_rel(dev, INPUT_REL_X, data->delta_x, false, K_FOREVER);
+#if CONFIG_PMW3389_REPORT_INTERVAL_MIN > 0
+	int64_t now = k_uptime_get();
+	// purge accumulated delta, if last sampled had not been reported on last report tick
+	if (now - data->last_smp_time >= CONFIG_PMW3389_REPORT_INTERVAL_MIN) {
+		LOG_DBG("Reset dx/dy");
+		data->dx = 0;
+		data->dy = 0;
 	}
-	if (data->delta_y != 0) {
-		input_report_rel(dev, INPUT_REL_Y, data->delta_y, true, K_FOREVER);
+	data->last_smp_time = now;
+#endif
+
+	data->dx += data->delta_x;
+	data->dy += data->delta_y;
+
+#if CONFIG_PMW3389_REPORT_INTERVAL_MIN > 0
+	if (now - data->last_rpt_time < CONFIG_PMW3389_REPORT_INTERVAL_MIN) {
+		LOG_DBG("Skip report");
+		return 0;
+	}
+#endif
+
+	// fetch report value
+	int16_t rx = (int16_t)CLAMP(data->dx, INT16_MIN, INT16_MAX);
+	int16_t ry = (int16_t)CLAMP(data->dy, INT16_MIN, INT16_MAX);
+	data->dx = data->dy = 0;
+
+	if ((rx != 0) || (ry != 0)) {
+		if (rx != 0) {
+			input_report_rel(dev, INPUT_REL_X, rx, !(ry != 0), K_FOREVER);
+		}
+		if (ry != 0) {
+			input_report_rel(dev, INPUT_REL_Y, ry, true, K_FOREVER);
+		}
+#if CONFIG_PMW3389_REPORT_INTERVAL_MIN > 0
+		data->last_rpt_time = now;
+#endif
 	}
 
 	return 0;
@@ -518,8 +563,6 @@ int pmw3389_init(const struct device *dev)
 		spi_release_dt(spec);
 		return -EIO;
 	}
-	LOG_DBG("Verified product ID!");
-	LOG_DBG("Verifying communication by reading inverse product ID");
 	k_busy_wait(DELAY_READ_READ);
 	TRY_R(read_register_nr(spec, REG_Inverse_Product_ID, &received_product_id));
 	if (received_product_id != Expected_Inverse_Product_ID) {
@@ -529,8 +572,10 @@ int pmw3389_init(const struct device *dev)
 		spi_release_dt(spec);
 		return -EIO;
 	}
-	LOG_DBG("Verified inverse product ID!");
 
+	uint8_t srom_id = 0;
+	TRY_R(read_register_nr(spec, REG_SROM_ID, &srom_id));
+	LOG_DBG("Product ID: %02x, srom_id: %02x", received_product_id, srom_id);
 	TRY(spi_release_dt(spec));
 
 	LOG_INF("Done!");
