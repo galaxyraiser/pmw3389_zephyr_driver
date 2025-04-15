@@ -367,11 +367,15 @@ static int pmw3389_report_data(const struct device *dev) {
 	int64_t now = k_uptime_get();
 	// purge accumulated delta, if last sampled had not been reported on last report tick
 	if (now - data->last_smp_time >= CONFIG_PMW3389_REPORT_INTERVAL_MIN) {
-		LOG_DBG("Reset dx/dy");
+		//LOG_DBG("Reset dx/dy");
 		data->dx = 0;
 		data->dy = 0;
 	}
 	data->last_smp_time = now;
+#endif
+
+#if CONFIG_PMW3389_INVERT_Y
+    data->delta_y = -data->delta_y;
 #endif
 
 	data->dx += data->delta_x;
@@ -379,7 +383,6 @@ static int pmw3389_report_data(const struct device *dev) {
 
 #if CONFIG_PMW3389_REPORT_INTERVAL_MIN > 0
 	if (now - data->last_rpt_time < CONFIG_PMW3389_REPORT_INTERVAL_MIN) {
-		LOG_DBG("Skip report");
 		return 0;
 	}
 #endif

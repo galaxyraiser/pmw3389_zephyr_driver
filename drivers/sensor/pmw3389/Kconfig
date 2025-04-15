@@ -19,4 +19,7 @@ config PMW3389_REPORT_INTERVAL_MIN
 		Slow down input reporting for hid queue over the air.
 		Turn value down to 8ms to get sharp response if use with USB only.
 
+config PMW3389_INVERT_Y
+    bool "Invert the Y axis"
+
 endif
