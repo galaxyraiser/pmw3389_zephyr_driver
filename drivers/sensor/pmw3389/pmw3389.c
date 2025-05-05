@@ -5,17 +5,10 @@
 #define DT_DRV_COMPAT pixart_pmw3389
 
 #include "pmw3389.h"
-#include <zephyr/drivers/gpio.h>
 #include <zephyr/pm/device.h>
 #include <zephyr/drivers/spi.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/__assert.h>
-#include <zephyr/input/input.h>
-
-LOG_MODULE_REGISTER(pmw3389, LOG_LEVEL_DBG);
-
-// Undefine to fall back to reading each register separately
-#define FETCH_USING_BURST_READ
 
 struct pmw3389_config {
 	struct spi_dt_spec spi;
@@ -23,25 +16,12 @@ struct pmw3389_config {
 	int resolution_cpi; // [counts/inch]
 };
 
-struct pmw3389_data {
-	const struct device     *dev;
+LOG_MODULE_REGISTER(pmw3389, LOG_LEVEL_DBG);
 
-	struct gpio_callback    irq_gpio_cb;    // motion pin irq callback
-	struct k_work           trigger_work;   // realtrigger job
-
-	int16_t delta_x;
-	int16_t delta_y;
-
-	int16_t dx, dy;
-
-#if CONFIG_PMW3389_REPORT_INTERVAL_MIN > 0
-	int64_t last_smp_time;
-	int64_t last_rpt_time;
-#endif
-};
+// Undefine to fall back to reading each register separately
+#define FETCH_USING_BURST_READ
 
 // region SPI Registers and Timing Constants
-
 #define REG_Product_ID		    0x00
 #define Expected_Product_ID	    0x47
 #define REG_Motion		    0x02
@@ -360,8 +340,7 @@ int pmw3389_channel_get(const struct device *dev, enum sensor_channel chan,
 static int pmw3389_report_data(const struct device *dev) {
 	struct pmw3389_data *data = dev->data;
 
-	pmw3389_sample_fetch(dev, SENSOR_CHAN_POS_DX);
-	//LOG_DBG("X: %i, Y: %i", data->delta_x, data->delta_y);
+	sensor_sample_fetch(dev);
 
 #if CONFIG_PMW3389_REPORT_INTERVAL_MIN > 0
 	int64_t now = k_uptime_get();
@@ -387,22 +366,21 @@ static int pmw3389_report_data(const struct device *dev) {
 	}
 #endif
 
-	// fetch report value
+    // fetch report value
 	int16_t rx = (int16_t)CLAMP(data->dx, INT16_MIN, INT16_MAX);
 	int16_t ry = (int16_t)CLAMP(data->dy, INT16_MIN, INT16_MAX);
 	data->dx = data->dy = 0;
 
-	if ((rx != 0) || (ry != 0)) {
-		if (rx != 0) {
-			input_report_rel(dev, INPUT_REL_X, rx, !(ry != 0), K_FOREVER);
-		}
-		if (ry != 0) {
-			input_report_rel(dev, INPUT_REL_Y, ry, true, K_FOREVER);
-		}
+    // TODO: lock free
+    struct k_msgq *out_q = atomic_ptr_get(&data->out_q);
+    if (out_q) {
+        k_msgq_put(out_q,
+                &(struct mouse_input_report){.x = rx, .y = ry, .t = k_uptime_get(), .dev = dev}, K_MSEC(10));
+    }
+
 #if CONFIG_PMW3389_REPORT_INTERVAL_MIN > 0
-		data->last_rpt_time = now;
+	data->last_rpt_time = now;
 #endif
-	}
 
 	return 0;
 }
@@ -429,7 +407,11 @@ static void pmw3389_gpio_callback(const struct device *gpiob, struct gpio_callba
 static void pmw3389_work_callback(struct k_work *work) {
 	struct pmw3389_data *data = CONTAINER_OF(work, struct pmw3389_data, trigger_work);
 	const struct device *dev = data->dev;
-	pmw3389_report_data(dev);
+	// invoke trigger handler
+	if (data->handler) {
+		data->handler(dev, NULL);
+	}
+    pmw3389_report_data(dev);
 	pmw3389_set_interrupt(dev, true);
 }
 
@@ -463,6 +445,30 @@ static int pmw3389_init_irq(const struct device *dev) {
 	pmw3389_set_interrupt(dev, true);
 
 	return err;
+}
+
+int pmw3389_set_resolution(const struct device *dev, int dpi)
+{
+	const struct pmw3389_config *config = dev->config;
+	const struct spi_dt_spec *spec = &config->spi;
+
+    // Set resolution
+	LOG_DBG("Configuring resolution: %d cpi", dpi);
+	if (dpi < 50 || dpi > 16000) {
+		LOG_ERR("Resolution of %d is out of range [%d, %d]", dpi, 50, 16000);
+		spi_release_dt(spec);
+		return -EINVAL;
+	}
+	if (dpi % 50 != 0) {
+		LOG_WRN("Resolution of %d is not a multiple of 50cpi!", config->resolution_cpi);
+	}
+	uint16_t resolution = dpi / 50;
+	k_busy_wait(DELAY_WRITE_WRITE);
+	TRY_R(write_register_nr(spec, REG_Resolution_H, resolution >> 8));
+	k_busy_wait(DELAY_WRITE_WRITE);
+	TRY_R(write_register_nr(spec, REG_Resolution_L, resolution & 0xFF));
+
+    return 0;
 }
 
 int pmw3389_init(const struct device *dev)
@@ -536,23 +542,9 @@ int pmw3389_init(const struct device *dev)
 	TRY_R(write_register_nr(spec, 0x10, 0x20));
 
 	// 11. Load configuration for other registers.
-
-	// Set resolution
-	LOG_DBG("Configuring resolution: %d cpi", config->resolution_cpi);
-	if (config->resolution_cpi < 50 || config->resolution_cpi > 16000) {
-		LOG_ERR("Resolution of %d is out of range [%d, %d]", config->resolution_cpi, 50,
-			16000);
-		spi_release_dt(spec);
-		return -EINVAL;
-	}
-	if (config->resolution_cpi % 50 != 0) {
-		LOG_WRN("Resolution of %d is not a multiple of 50cpi!", config->resolution_cpi);
-	}
-	uint16_t resolution = config->resolution_cpi / 50;
-	k_busy_wait(DELAY_WRITE_WRITE);
-	TRY_R(write_register_nr(spec, REG_Resolution_H, resolution >> 8));
-	k_busy_wait(DELAY_WRITE_WRITE);
-	TRY_R(write_register_nr(spec, REG_Resolution_L, resolution & 0xFF));
+    if ((err = pmw3389_set_resolution(dev, config->resolution_cpi)) != 0) {
+        return err;
+    }
 
 	// Verify communication
 	LOG_DBG("Verifying communication by reading product ID");
@@ -622,15 +614,34 @@ int pmw3389_channel_get(const struct device *dev, enum sensor_channel chan,
 		return -ENOTSUP;
 	}
 
-	TRY(sensor_value_from_double(val, (double)counts / (39.3700787 * config->resolution_cpi)));
+	val->val1 = counts;
+	//TRY(sensor_value_from_double(val, (double)counts / (39.3700787 * config->resolution_cpi)));
 
 	return 0;
+}
+
+int pmw3389_trigger_set(const struct device *dev,
+			     const struct sensor_trigger *trig,
+			     sensor_trigger_handler_t handler)
+{
+	struct pmw3389_data *data = dev->data;
+    // TODO: atomic set
+    data->handler = handler;
+	return 0;
+}
+
+int pmw3389_attr_set(const struct device *dev, enum sensor_channel chan, enum sensor_attribute attr,
+                    const struct sensor_value *val)
+{
+    return pmw3389_set_resolution(dev, val->val1);
 }
 
 // endregion
 static const struct sensor_driver_api pmw3389_api = {
 	.sample_fetch = pmw3389_sample_fetch,
 	.channel_get = pmw3389_channel_get,
+    .trigger_set = pmw3389_trigger_set,
+    .attr_set = pmw3389_attr_set,
 };
 
 #if IS_ENABLED(CONFIG_PM_DEVICE)

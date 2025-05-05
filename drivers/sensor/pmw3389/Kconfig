@@ -14,7 +14,7 @@ if PMW3389
 
 config PMW3389_REPORT_INTERVAL_MIN
 	int "PMW3389's default minimum report rate"
-	default 10
+	default 5
 	help
 	  Default minimum report interval in milliseconds.
 		Slow down input reporting for hid queue over the air.
