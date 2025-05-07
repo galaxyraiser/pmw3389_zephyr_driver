@@ -41,6 +41,10 @@ struct mouse_input_report
     const struct device *dev;
 } __attribute__((aligned(8)));
 
+
+/* Attribute set for message queue  */
+#define PMW3389_ATTR_SET_PIPE   (SENSOR_ATTR_PRIV_START + 1)
+
 /**
  * Read raw pixel data from sensor
  * @note Untested, may be broken

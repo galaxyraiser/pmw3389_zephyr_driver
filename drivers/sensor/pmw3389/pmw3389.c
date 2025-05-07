@@ -599,7 +599,7 @@ int pmw3389_sample_fetch(const struct device *dev, enum sensor_channel chan)
 int pmw3389_channel_get(const struct device *dev, enum sensor_channel chan,
 			struct sensor_value *val)
 {
-	const struct pmw3389_config *config = dev->config;
+	//const struct pmw3389_config *config = dev->config;
 	const struct pmw3389_data *data = dev->data;
 	int16_t counts;
 
@@ -624,15 +624,27 @@ int pmw3389_trigger_set(const struct device *dev,
 			     const struct sensor_trigger *trig,
 			     sensor_trigger_handler_t handler)
 {
-	struct pmw3389_data *data = dev->data;
+	// struct pmw3389_data *data = dev->data;
     // TODO: atomic set
-    data->handler = handler;
+    // data->handler = handler;
 	return 0;
+}
+
+static int set_pipe_desc(const struct device *dev, const struct k_msgq *q)
+{
+    struct pmw3389_data *data = dev->data;
+    atomic_ptr_set(&data->out_q, (atomic_ptr_val_t)q);
+    return 0;
 }
 
 int pmw3389_attr_set(const struct device *dev, enum sensor_channel chan, enum sensor_attribute attr,
                     const struct sensor_value *val)
 {
+    if (attr == PMW3389_ATTR_SET_PIPE) {
+        return set_pipe_desc(dev, (const struct k_msgq*)val->val1);
+    }
+
+    // Default for now
     return pmw3389_set_resolution(dev, val->val1);
 }
 
